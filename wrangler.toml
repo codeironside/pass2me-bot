@@ -1,0 +1,82 @@
+name = "wa-stores"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "pas2me-stores"
+database_id = "46009d94-37b4-4536-bc7d-7ec37c389ef0"
+
+# KV Namespaces
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "1ebc3bdbc7174b65bde15e78da47eba5" 
+preview_id = "f13ca7e2a27e4af09f380e5bbbd98df8"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "6539a761c1194f73974c37ce1b1bb178"
+preview_id = "b07a61aa72a34dccb479afa7dbe1072b"
+
+# R2 Bucket
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "pas2me-storage"
+
+[env.production]
+name = "wa-stores-prod"
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "pas2me-stores"
+database_id = "46009d94-37b4-4536-bc7d-7ec37c389ef0"
+
+[[env.production.kv_namespaces]]
+binding = "SESSIONS"
+id = "1ebc3bdbc7174b65bde15e78da47eba5"
+preview_id = "f13ca7e2a27e4af09f380e5bbbd98df8"
+
+[[env.production.kv_namespaces]]
+binding = "CACHE"
+id = "6539a761c1194f73974c37ce1b1bb178"
+preview_id = "b07a61aa72a34dccb479afa7dbe1072b"
+
+[[env.production.r2_buckets]]
+binding = "STORAGE"
+bucket_name = "pas2me-storage"
+
+[env.staging]
+name = "wa-stores-staging"
+[env.staging.vars]
+ENVIRONMENT = "staging"
+WHATSAPP_PHONE_NUMBER_ID = "1014522441749873"
+PAYSTACK_PUBLIC_KEY = "pk_test_30d303b8f93fde06a436fef3bc925b54f05c4fb1"
+CLOUDINARY_CLOUD_NAME = "ddkrpymbt"
+CLOUDINARY_API_KEY = "2HS7C1zi-LrtqR-jImhuDqI7ZiA"
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "pas2me-stores"
+database_id = "46009d94-37b4-4536-bc7d-7ec37c389ef0"
+
+[[env.staging.kv_namespaces]]
+binding = "SESSIONS"
+id = "1ebc3bdbc7174b65bde15e78da47eba5"
+preview_id = "f13ca7e2a27e4af09f380e5bbbd98df8"
+
+[[env.staging.kv_namespaces]]
+binding = "CACHE"
+id = "6539a761c1194f73974c37ce1b1bb178"
+preview_id = "b07a61aa72a34dccb479afa7dbe1072b"
+
+[[env.staging.r2_buckets]]
+binding = "STORAGE"
+bucket_name = "pas2me-storage"
+
+# Environment Variables
+[vars]
+ENVIRONMENT = "development"
+WHATSAPP_PHONE_NUMBER_ID = "1014522441749873"
+PAYSTACK_PUBLIC_KEY = "pk_test_30d303b8f93fde06a436fef3bc925b54f05c4fb1"
+CLOUDINARY_CLOUD_NAME = "ddkrpymbt"
+CLOUDINARY_API_KEY = "2HS7C1zi-LrtqR-jImhuDqI7ZiA"

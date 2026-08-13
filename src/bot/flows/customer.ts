@@ -1,6 +1,5 @@
 import type { Db } from '../../db/client';
 import {
-  findUserById,
   getContext,
   getInventoryQty,
   applyPaidOrderToInventory,
@@ -23,10 +22,11 @@ import {
   kobo,
   type Kobo,
 } from '../../domain/money';
-import { newId, nowIso, normalizePhone } from '../../domain/ids';
-import { sendDocument, sendDocumentToPhone, sendImage, sendMenuMessage, sendText } from '../../services/whatsapp';
+import { newId, nowIso } from '../../domain/ids';
+import { sendDocument, sendImage, sendMenuMessage, sendText } from '../../services/whatsapp';
 import { loadCoverBytes } from '../../services/media';
 import { buildOrderReceiptPdf } from '../../services/receiptPdf';
+import { notifyVendorsOfPaidOrder } from '../../services/orderNotify';
 import {
   createCheckout,
   describeBankTransferInstructions,
@@ -1569,66 +1569,6 @@ async function ensureCustomer(
   return id;
 }
 
-function storeNotifyPhones(
-  db: Db,
-  store: {
-    id: string;
-    user_id: string;
-    whatsapp_number?: string | null;
-  }
-): string[] {
-  const phones = new Set<string>();
-  const add = (raw?: string | null) => {
-    if (!raw) return;
-    const n = normalizePhone(raw);
-    if (n.length >= 11) phones.add(n);
-  };
-
-  const owner = findUserById(db, store.user_id);
-  add(owner?.phone);
-  add(store.whatsapp_number);
-
-  try {
-    const storeRow = db
-      .prepare(`SELECT whatsapp_number FROM stores WHERE id = ?`)
-      .get(store.id) as { whatsapp_number?: string | null } | undefined;
-    add(storeRow?.whatsapp_number);
-  } catch {
-    /* column may be missing */
-  }
-
-  try {
-    const ops = db
-      .prepare(
-        `SELECT phone, normalized_phone FROM store_whatsapp_operators WHERE store_id = ?`
-      )
-      .all(store.id) as Array<{
-      phone: string | null;
-      normalized_phone: string | null;
-    }>;
-    for (const op of ops) {
-      add(op.normalized_phone || op.phone);
-    }
-  } catch {
-    /* table may not exist */
-  }
-
-  try {
-    const staff = db
-      .prepare(
-        `SELECT u.phone FROM staff_assignments sa
-         JOIN users u ON u.id = sa.user_id
-         WHERE sa.store_id = ? AND sa.is_active = 1`
-      )
-      .all(store.id) as Array<{ phone: string | null }>;
-    for (const row of staff) add(row.phone);
-  } catch {
-    /* ignore */
-  }
-
-  return [...phones];
-}
-
 async function sendWalletOrderReceipts(
   db: Db,
   params: {
@@ -1641,6 +1581,7 @@ async function sendWalletOrderReceipts(
       whatsapp_number?: string | null;
     };
     cart: CartItem[];
+    orderId: string;
     orderNumber: string;
     itemsTotal: Kobo;
     deliveryFeeKobo: number;
@@ -1736,61 +1677,7 @@ async function sendWalletOrderReceipts(
     );
   }
 
-  const sellerPhones = storeNotifyPhones(db, params.store);
-  const sentPhones = new Set<string>();
-
-  if (sellerPhones.length === 0) {
-    console.warn(
-      `[order] vendor receipt skipped — no WhatsApp phone on store=${params.store.id} (${storeName}). Set the store WhatsApp number or owner phone.`
-    );
-    await sendText(
-      params.chatId,
-      `Paid. The vendor copy could not be sent — *${storeName}* has no WhatsApp number on file.`
-    );
-    return;
-  }
-
-  let vendorPdf: Buffer;
-  try {
-    vendorPdf = await buildOrderReceiptPdf(db, {
-      ...pdfBase,
-      audience: 'vendor',
-    });
-  } catch (err) {
-    console.error('[order] vendor PDF build failed', err);
-    return;
-  }
-
-  let vendorSent = 0;
-  for (const phone of sellerPhones) {
-    if (sentPhones.has(phone)) continue;
-    sentPhones.add(phone);
-    const result = await sendDocumentToPhone(db, phone, vendorPdf, {
-      fileName,
-      caption: [
-        `New paid order *${params.orderNumber}*`,
-        `Buyer: ${buyerName}`,
-        `Total: *${formatNgn(params.total)}*`,
-        'Reply *merchant* to manage this order.',
-      ].join('\n'),
-    });
-    if (result.ok) {
-      vendorSent += 1;
-      console.log(
-        `[order] vendor receipt delivered store=${storeName} order=${params.orderNumber} phone=${phone} jid=${result.jid}`
-      );
-    } else {
-      console.error(
-        `[order] vendor receipt failed store=${storeName} order=${params.orderNumber} to ${phone}`
-      );
-    }
-  }
-
-  if (vendorSent === 0) {
-    console.warn(
-      `[order] vendor receipt not delivered for ${params.orderNumber} (${storeName}). ${sellerPhones.length} phone(s) on file.`
-    );
-  }
+  await notifyVendorsOfPaidOrder(db, params.orderId, 'Wallet');
 }
 
 async function completeCheckout(
@@ -2093,6 +1980,7 @@ async function completeCheckout(
           identity,
           store: row.store,
           cart: row.items,
+          orderId: row.orderId,
           orderNumber: row.orderNumber,
           itemsTotal: row.itemsTotal,
           deliveryFeeKobo: row.deliveryFeeKobo,

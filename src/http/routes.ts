@@ -10,6 +10,7 @@ import {
   notifyWalletTopup,
 } from '../bot/flows/wallet';
 import { applyPaidOrderToInventory, findUserByPhone, writeBotAudit } from '../db/repos';
+import { notifyVendorsOfPaidOrder } from '../services/orderNotify';
 import { kobo, nairaToKobo } from '../domain/money';
 import { newId, normalizePhone, nowIso } from '../domain/ids';
 import { createOtpChallenge, verifyOtp } from '../services/sms';
@@ -457,6 +458,12 @@ async function handleMonnifyPaymentWebhook(db: Db, body: unknown): Promise<void>
         resource_id: order.id,
         details: { reference },
       });
+
+      try {
+        await notifyVendorsOfPaidOrder(db, order.id, 'Monnify');
+      } catch (err) {
+        console.error('[order] vendor payment notice failed', err);
+      }
     }
     return;
   }

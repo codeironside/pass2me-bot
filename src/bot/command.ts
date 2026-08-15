@@ -7,6 +7,8 @@ export type MenuOption = { id: string; label: string };
 
 const ALIASES: Record<string, string> = {
   browse: 'cust_browse',
+  marketplace: 'cust_browse',
+  'market place': 'cust_browse',
   search: 'cust_search',
   next: 'browse_next',
   more: 'browse_next',
@@ -38,6 +40,13 @@ const ALIASES: Record<string, string> = {
   start: 'cust_home',
   hi: 'cust_home',
   hello: 'cust_home',
+  sell: 'cust_inventory',
+  inventory: 'cust_inventory',
+  stock: 'cust_inventory',
+  'sell on pas2me': 'cust_inventory',
+  'create store': 'merch_add_store',
+  'add store': 'merch_add_store',
+  'new store': 'merch_add_store',
 };
 
 /** hi / hello / start / menu — always jump back to the home menu */
@@ -75,26 +84,36 @@ export function resolveCommand(params: {
   text: string;
   interactiveId?: string;
   lastMenu?: MenuOption[];
+  /** When collecting qty / phone / price, do not treat 1–9 as menu picks. */
+  ignoreNumericMenu?: boolean;
 }): string {
   const interactive = params.interactiveId?.trim();
-  if (interactive) return interactive.toLowerCase();
+  if (interactive) return interactive;
 
   const raw = params.text.trim();
   const lower = raw.toLowerCase();
 
-  // Numeric pick from last menu (1-based)
-  if (/^\d{1,2}$/.test(lower) && params.lastMenu && params.lastMenu.length > 0) {
+  // Numeric pick from last menu (1-based). Keep original id casing
+  // (product ids use nanoid mixed case).
+  if (
+    !params.ignoreNumericMenu &&
+    /^\d{1,2}$/.test(lower) &&
+    params.lastMenu &&
+    params.lastMenu.length > 0
+  ) {
     const idx = Number(lower) - 1;
     if (idx >= 0 && idx < params.lastMenu.length) {
-      return params.lastMenu[idx]!.id.toLowerCase();
+      return params.lastMenu[idx]!.id;
     }
   }
 
-  // Direct cust_* / prod_* / add_* / pay_* / loc_* / merch_* tokens
+  // Direct tokens — preserve case so product/store ids still match SQLite
   if (
-    /^(cust_|prod_|add_|save_|saved_|pay_|loc_|log_|merch_|wal_|inv_|mode_|dev_)/i.test(lower)
+    /^(cust_|prod_|view_|add_|save_|saved_|pay_|loc_|log_|merch_|wal_|inv_|mode_|dev_|cat_)/i.test(
+      raw
+    )
   ) {
-    return lower;
+    return raw;
   }
 
   if (ALIASES[lower]) return ALIASES[lower]!;

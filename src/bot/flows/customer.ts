@@ -28,6 +28,7 @@ import { loadCoverBytes } from '../../services/media';
 import { buildOrderReceiptPdf } from '../../services/receiptPdf';
 import { notifyVendorsOfPaidOrder } from '../../services/orderNotify';
 import {
+  createBankTransferCharge,
   createCheckout,
   describeBankTransferInstructions,
 } from '../../services/monnify';
@@ -92,7 +93,7 @@ async function requireRegistered(
       '',
       'Sign up at https://www.pas2me.com then message this bot again.',
       '',
-      'As a guest you can still *browse* and *search* products.',
+      'As a guest you can still open *marketplace* and *search* products.',
       'Reply *menu* for options.',
     ].join('\n')
   );
@@ -295,31 +296,32 @@ export async function sendCustomerHome(
 ): Promise<void> {
   const registered = isRegistered(identity);
   const guestOptions: MenuOption[] = [
-    { id: 'cust_browse', label: 'Browse' },
+    { id: 'cust_browse', label: 'Marketplace' },
     { id: 'cust_search', label: 'Search' },
     { id: 'cust_signup_info', label: 'Create account' },
   ];
   const memberOptions: MenuOption[] = [
-    { id: 'cust_browse', label: 'Browse' },
+    { id: 'cust_browse', label: 'Marketplace' },
     { id: 'cust_search', label: 'Search' },
     { id: 'cust_cart', label: 'Cart' },
     { id: 'cust_saved', label: 'Saved for later' },
     { id: 'cust_orders', label: 'My orders' },
     { id: 'cust_wallet', label: 'Wallet' },
     { id: 'cust_profile', label: 'Profile' },
+    { id: 'cust_inventory', label: 'Inventory' },
   ];
 
   const body = registered
     ? [
         `Hi *${displayName(identity)}* 👋`,
         'Welcome to *Pas2me* marketplace.',
-        'Browse, cart, orders, wallet, and profile.',
+        'Marketplace, cart, orders, wallet, profile — or open *Inventory* to sell.',
       ].join('\n')
     : [
         'Welcome to *Pas2me* marketplace.',
         '',
         'You are browsing as a *guest*.',
-        'Browse and search are open. Cart, checkout, wallet, and orders need an account on https://www.pas2me.com',
+        'Marketplace and search are open. Cart, checkout, wallet, and orders need an account on https://www.pas2me.com',
       ].join('\n');
 
   await sendMenu(
@@ -406,7 +408,7 @@ async function showMarketplacePage(
     await sendText(
       chatId,
       query?.trim()
-        ? `No products matched *${query.trim()}*. Reply *browse* or *search*.`
+        ? `No products matched *${query.trim()}*. Reply *marketplace* or *search*.`
         : 'No products in the marketplace yet.'
     );
     return;
@@ -435,7 +437,7 @@ async function showMarketplacePage(
   });
 
   const options: MenuOption[] = products.map((p) => ({
-    id: `prod_${p.id}`,
+    id: `view_${p.id}`,
     label: `${p.name} · ${formatNgn(decimalToKobo(p.price))}`.slice(0, 36),
   }));
   if (safePage + 1 < pageCount) {
@@ -542,7 +544,7 @@ async function saveCartForLater(
     ].join('\n'),
     [
       { id: 'cust_saved', label: 'View saved' },
-      { id: 'cust_browse', label: 'Keep shopping' },
+      { id: 'cust_browse', label: 'Marketplace' },
     ]
   );
 }
@@ -656,11 +658,101 @@ export async function handleCustomerMessage(
     text,
     interactiveId,
     lastMenu: lastMenuFromConv(conv),
+    ignoreNumericMenu:
+      conv.state.startsWith('merch_inv_') &&
+      conv.state !== 'merch_inv_sell_pay' &&
+      conv.state !== 'merch_inv_list' &&
+      conv.state !== 'merch_inv_item' &&
+      conv.state !== 'merch_inv_edit' &&
+      conv.state !== 'merch_inv_sell_pick' &&
+      !interactiveId,
   });
   const lower = text.trim().toLowerCase();
 
+  if (conv.state.startsWith('merch_inv_')) {
+    const { handleInventoryMessage } = await import('./merchantInventory');
+    if (
+      await handleInventoryMessage(
+        db,
+        identity,
+        chatId,
+        conv.selected_store_id ?? undefined,
+        text,
+        interactiveId
+      )
+    ) {
+      return;
+    }
+  }
+
   if (cmd === 'cust_home' || lower === 'menu' || lower === 'help') {
     await sendCustomerHome(db, chatId, identity);
+    return;
+  }
+
+  if (
+    cmd === 'cust_inventory' ||
+    cmd === 'cust_sell' ||
+    lower === 'inventory' ||
+    lower === 'sell'
+  ) {
+    const { openInventoryHub } = await import('./merchantInventory');
+    await openInventoryHub(db, identity, chatId);
+    return;
+  }
+
+  if (
+    cmd === 'merch_add_store' ||
+    lower === 'create store' ||
+    lower === 'add store' ||
+    lower === 'new store'
+  ) {
+    if (!identity.user) {
+      await sendText(
+        chatId,
+        [
+          'To create a store you need a Pas2me account.',
+          'Sign up at https://www.pas2me.com with this WhatsApp number,',
+          'then reply *inventory*.',
+        ].join('\n')
+      );
+      return;
+    }
+    const { startCreateStore } = await import('./merchantLocations');
+    updateConversation(db, phone, { mode: 'merchant', state: 'idle' });
+    await startCreateStore(db, identity, chatId);
+    return;
+  }
+
+  if (
+    cmd === 'merch_add_product' ||
+    lower === 'add product' ||
+    lower === 'new product' ||
+    lower === 'create product'
+  ) {
+    if (!identity.user) {
+      await sendText(
+        chatId,
+        'Sign up at https://www.pas2me.com first, then create a store with *create store* before adding products.'
+      );
+      return;
+    }
+    const storeCount = new Set([
+      ...identity.ownedStoreIds,
+      ...identity.staffRoles.map((s) => s.storeId),
+    ]).size;
+    updateConversation(db, phone, { mode: 'merchant', state: 'idle' });
+    if (storeCount === 0) {
+      await sendText(
+        chatId,
+        'Products must belong to a store. Create a store in *Inventory* first.'
+      );
+      const { openInventoryHub } = await import('./merchantInventory');
+      await openInventoryHub(db, identity, chatId);
+      return;
+    }
+    const { handleMerchantMessage } = await import('./merchant');
+    await handleMerchantMessage(db, identity, chatId, 'add product', undefined);
     return;
   }
 
@@ -715,7 +807,7 @@ export async function handleCustomerMessage(
     return;
   }
 
-  if (cmd === 'cust_browse' || lower === 'browse') {
+  if (cmd === 'cust_browse' || lower === 'browse' || lower === 'marketplace') {
     await showMarketplacePage(db, chatId, phone, 0);
     return;
   }
@@ -885,7 +977,7 @@ export async function handleCustomerMessage(
       await sendMenu(db, chatId, phone, `Added *${qty}× ${product.name}* to cart.`, [
         { id: 'cust_cart', label: 'View cart' },
         { id: 'cust_checkout', label: 'Checkout' },
-        { id: 'cust_browse', label: 'Keep shopping' },
+        { id: 'cust_browse', label: 'Marketplace' },
       ]);
       return;
     }
@@ -915,17 +1007,30 @@ export async function handleCustomerMessage(
     }
   }
 
-  if (cmd.startsWith('prod_')) {
-    const productId = cmd.slice('prod_'.length);
+  if (cmd.startsWith('view_') || cmd.startsWith('prod_')) {
+    const productId = cmd.startsWith('view_')
+      ? cmd.slice('view_'.length)
+      : cmd.startsWith('prod_prod_')
+        ? cmd.slice('prod_'.length)
+        : cmd.slice('prod_'.length);
     const product = getProduct(db, productId);
     if (!product) {
       await sendText(chatId, 'Product not found.');
       return;
     }
     const qty = getInventoryQty(db, product.id);
+    if (qty <= 0) {
+      await sendText(
+        chatId,
+        `*${product.name}* is currently out of stock and hidden from the shop.`
+      );
+      return;
+    }
     const price = formatNgn(decimalToKobo(product.price));
     const body = [
       `*${product.name}*`,
+      product.brand ? `Brand: ${product.brand}` : '',
+      product.category_name ? `Category: ${product.category_name}` : '',
       `Store: ${product.store_name}`,
       `Price: ${price}`,
       product.description ? `\n${product.description}` : '',
@@ -1019,7 +1124,7 @@ export async function handleCustomerMessage(
       ].join('\n'),
       [
         { id: 'cust_saved', label: 'View saved' },
-        { id: 'cust_browse', label: 'Keep shopping' },
+        { id: 'cust_browse', label: 'Marketplace' },
       ]
     );
     return;
@@ -1036,13 +1141,13 @@ export async function handleCustomerMessage(
         phone,
         savedCount
           ? 'Your cart is empty. You have items saved for later.'
-          : 'Your cart is empty. Reply *browse* to shop.',
+          : 'Your cart is empty. Reply *marketplace* to shop.',
         savedCount
           ? [
               { id: 'cust_saved', label: 'Saved for later' },
-              { id: 'cust_browse', label: 'Browse' },
+              { id: 'cust_browse', label: 'Marketplace' },
             ]
-          : [{ id: 'cust_browse', label: 'Browse' }]
+          : [{ id: 'cust_browse', label: 'Marketplace' }]
       );
       return;
     }
@@ -1068,7 +1173,7 @@ export async function handleCustomerMessage(
       { id: 'cust_checkout', label: 'Checkout' },
       { id: 'cust_save_later', label: 'Save for later' },
       { id: 'cust_clear_cart', label: 'Clear cart' },
-      { id: 'cust_browse', label: 'Keep shopping' },
+      { id: 'cust_browse', label: 'Marketplace' },
     ]);
     return;
   }
@@ -1168,7 +1273,7 @@ export async function handleCustomerMessage(
 
   await sendText(
     chatId,
-    `I didn't understand that.\nReply *menu* for options, or *browse* / *search*.`
+    `I didn't understand that.\nReply *menu* for options, or *marketplace* / *search*.`
   );
 }
 
@@ -2022,9 +2127,19 @@ async function completeCheckout(
   updateConversation(db, identity.phone, { cart_json: '[]', state: 'idle' });
 
   if (method === 'bank') {
+    const charge = await createBankTransferCharge({
+      amount: total,
+      customerPhone: identity.phone,
+      customerName: identity.user
+        ? `${identity.user.first_name} ${identity.user.last_name}`.trim()
+        : undefined,
+      description: `Pas2me ${created.length > 1 ? 'orders' : 'order'} ${created.map((c) => c.orderNumber).join(', ')}`,
+      reference,
+      callbackUrl: `${env.BOT_PUBLIC_URL}/webhooks/monnify/payment`,
+    });
     await sendText(
       chatId,
-      describeBankTransferInstructions(reference, total) +
+      describeBankTransferInstructions(reference, total, charge) +
         `\n\nOrder(s) ${orderLabel} created (awaiting payment).`
     );
     return;

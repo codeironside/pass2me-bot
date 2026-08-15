@@ -97,7 +97,10 @@ export async function handleDeveloperMessage(
   if (cmd === 'mode_merchant' || lower === 'merchant') {
     const { canAccessMerchant } = await import('../identity');
     if (!canAccessMerchant(identity)) {
-      await sendText(chatId, 'No merchant access on this phone.');
+      await sendText(
+        chatId,
+        'Sign up at https://www.pas2me.com with this WhatsApp number to sell and create a store.'
+      );
       return;
     }
     updateConversation(db, identity.phone, { mode: 'merchant', state: 'idle' });

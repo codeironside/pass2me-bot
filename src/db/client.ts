@@ -215,6 +215,11 @@ function ensurePlatformStoreColumns(db: Db): void {
   ensureColumn(db, 'stores', 'archived_at', 'DATETIME');
 }
 
+function ensureProductCatalogColumns(db: Db): void {
+  if (tableColumns(db, 'products').size === 0) return;
+  ensureColumn(db, 'products', 'brand', 'TEXT');
+}
+
 function ensureInventorySupportTables(db: Db): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS inventory_movements (
@@ -301,6 +306,7 @@ export function runMigrations(db: Db = getDb()): void {
   }
 
   ensurePlatformStoreColumns(db);
+  ensureProductCatalogColumns(db);
   ensureBotConversationColumns(db);
   try {
     ensureInventorySupportTables(db);

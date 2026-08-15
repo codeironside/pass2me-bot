@@ -14,6 +14,11 @@ const envSchema = z.object({
   /** Baileys multi-file auth directory (relative to cwd or absolute) */
   WA_AUTH_DIR: z.string().default('./data/baileys_auth'),
   /**
+   * Bot WhatsApp number for pairing-code login (digits with country code, e.g. 2348012345678).
+   * Faster and more reliable than QR in Windows terminals.
+   */
+  WA_PAIRING_PHONE: z.preprocess(emptyToUndefined, z.string().optional()),
+  /**
    * Interactive UX for menus:
    * - text  = numbered menus only (safest / least ban risk)
    * - list / buttons = currently same as text (interactive UI fingerprints unofficial)
@@ -46,6 +51,17 @@ const envSchema = z.object({
     const s = String(v).trim().toLowerCase();
     return s === '1' || s === 'true' || s === 'yes';
   }, z.boolean().default(false)),
+
+  R2_ACCOUNT_ID: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_ACCESS_KEY_ID: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_SECRET_ACCESS_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_ENDPOINT: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_BUCKET: z.preprocess(emptyToUndefined, z.string().optional()),
+  /**
+   * Public base that serves GET /media/* from the wa-stores worker (R2).
+   * Example: http://localhost:8787/media  or  https://your-api.workers.dev/media
+   */
+  R2_PUBLIC_BASE_URL: z.preprocess(emptyToUndefined, z.string().optional()),
 
   MONNIFY_BASE_URL: z.string().url().default('https://sandbox.monnify.com'),
   MONNIFY_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),

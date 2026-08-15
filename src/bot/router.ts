@@ -163,13 +163,28 @@ async function handleIncomingMessage(
     return;
   }
 
-  // Quantity reply must not be treated as a numbered menu pick
+  // Quantity / typed replies must not be treated as a numbered menu pick
   const convEarly = getOrCreateConversation(db, phone);
-  if (
-    convEarly.state === 'awaiting_cart_qty' &&
-    /^\d{1,4}$/.test(text.trim()) &&
-    !interactiveId
-  ) {
+  const typedInputState =
+    convEarly.state === 'awaiting_cart_qty' ||
+    convEarly.state === 'merch_inv_sell_qty' ||
+    convEarly.state === 'merch_inv_sell_phone' ||
+    convEarly.state === 'merch_inv_receive' ||
+    convEarly.state === 'merch_inv_set' ||
+    convEarly.state === 'merch_inv_edit_price';
+  if (typedInputState && /^\d{1,15}$/.test(text.trim()) && !interactiveId) {
+    if (convEarly.state.startsWith('merch_inv_')) {
+      await handleMerchantMessage(
+        db,
+        identity,
+        chatId,
+        text,
+        interactiveId,
+        msg.location,
+        msg
+      );
+      return;
+    }
     await handleCustomerMessage(
       db,
       identity,
@@ -205,7 +220,10 @@ async function handleIncomingMessage(
   ) {
     identity = resolveIdentity(db, phone);
     if (!canAccessMerchant(identity)) {
-      await sendText(chatId, 'No merchant access on this phone.');
+      await sendText(
+        chatId,
+        'Sign up at https://www.pas2me.com with this WhatsApp number to sell and create a store.'
+      );
       return;
     }
     // Drop wallet/airtime collection so merchant menu numbers aren't stolen
@@ -294,7 +312,7 @@ async function handleIncomingMessage(
           'If you signed up with a different number, reply:',
           '*link 08XXXXXXXXXX*',
           '',
-          'You can still *browse* and *search* as a guest.',
+          'You can still open *marketplace* and *search* as a guest.',
         ].join('\n')
       );
     }

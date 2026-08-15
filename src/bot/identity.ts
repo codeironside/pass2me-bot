@@ -200,11 +200,7 @@ export function canEditLocation(
   );
 }
 
-/** True when identity may use merchant mode (owns/staffed store or superadmin). */
+/** True when identity may use merchant mode (any signed-up user can sell). */
 export function canAccessMerchant(identity: ResolvedIdentity): boolean {
-  return (
-    identity.isSuperAdmin ||
-    identity.ownedStoreIds.length > 0 ||
-    identity.staffRoles.length > 0
-  );
+  return Boolean(identity.user) || identity.isSuperAdmin;
 }

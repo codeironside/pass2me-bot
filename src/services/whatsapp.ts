@@ -226,6 +226,29 @@ export async function sendText(chatId: string, text: string): Promise<void> {
   }
 }
 
+/** Send text with no typing delay — used for receipts to a third-party number. */
+export async function sendTextImmediate(chatId: string, text: string): Promise<boolean> {
+  if (!allowOutbound(chatId)) {
+    console.warn('Outbound rate limit hit for', chatId);
+    return false;
+  }
+  const jid = toBaileysJid(chatId);
+  try {
+    await ensureSendSession(jid);
+    const sent = await getSock().sendMessage(jid, { text });
+    const id = sent?.key?.id;
+    if (!id) {
+      console.error(`[WA] sendTextImmediate got no message id for ${jid}`);
+      return false;
+    }
+    console.log(`[WA] sent immediate text to ${jid} id=${id}`);
+    return true;
+  } catch (err) {
+    console.error(`[WA] sendTextImmediate failed for ${jid}:`, err);
+    return false;
+  }
+}
+
 /** Send an image (buffer or local file path) with optional caption. */
 export async function sendImage(
   chatId: string,
@@ -279,6 +302,38 @@ export async function sendDocument(
   } catch (err) {
     console.error(`[WA] sendDocument failed for ${jid}:`, err);
     if (caption) await sendText(chatId, caption);
+    return false;
+  }
+}
+
+/** PDF send with no typing delay. */
+export async function sendDocumentImmediate(
+  chatId: string,
+  file: Buffer,
+  opts: { fileName: string; mimetype?: string; caption?: string }
+): Promise<boolean> {
+  if (!allowOutbound(chatId)) {
+    console.warn('Outbound rate limit hit for', chatId);
+    return false;
+  }
+  const jid = toBaileysJid(chatId);
+  try {
+    await ensureSendSession(jid);
+    const sent = await getSock().sendMessage(jid, {
+      document: file,
+      mimetype: opts.mimetype || 'application/pdf',
+      fileName: opts.fileName,
+      caption: opts.caption?.trim() || undefined,
+    });
+    const id = sent?.key?.id;
+    if (!id) {
+      console.error(`[WA] sendDocumentImmediate got no message id for ${jid}`);
+      return false;
+    }
+    console.log(`[WA] sent immediate document ${opts.fileName} to ${jid} id=${id}`);
+    return true;
+  } catch (err) {
+    console.error(`[WA] sendDocumentImmediate failed for ${jid}:`, err);
     return false;
   }
 }
@@ -516,6 +571,53 @@ async function ensureSendSession(jid: string): Promise<void> {
   }
 }
 
+/**
+ * First message to a stranger: fetch their devices + encrypt keys.
+ * WhatsApp does not require them to have messaged us first.
+ */
+async function prepareColdRecipient(
+  s: NonNullable<ReturnType<typeof getWhatsAppSocket>>,
+  jids: string[]
+): Promise<void> {
+  const unique = [...new Set(jids.filter(Boolean))];
+  if (unique.length === 0) return;
+
+  try {
+    const devices = await s.getUSyncDevices(unique, false, false);
+    const deviceJids = devices
+      .map((d) => d.jid)
+      .filter((id): id is string => Boolean(id));
+    console.log(
+      `[WA] USync devices for ${unique.join(', ')} → ${deviceJids.join(', ') || '(none)'}`
+    );
+    if (deviceJids.length > 0) {
+      await s.assertSessions(deviceJids, true);
+    }
+  } catch (err) {
+    console.warn(
+      '[WA] getUSyncDevices failed',
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  try {
+    await s.assertSessions(unique, true);
+  } catch (err) {
+    console.warn(
+      '[WA] assertSessions(recipients) failed',
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  for (const jid of unique) {
+    try {
+      await s.presenceSubscribe(jid);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 /** Deliver a vendor PDF even if they have never messaged the bot. */
 export async function sendDocumentToPhone(
   db: Db,
@@ -523,30 +625,220 @@ export async function sendDocumentToPhone(
   file: Buffer,
   opts: { fileName: string; mimetype?: string; caption?: string }
 ): Promise<{ ok: boolean; jid?: string }> {
-  const targets = await resolveOutboundChatIds(db, phone);
-  console.log(
-    `[WA] vendor deliver targets for ${normalizePhone(phone)}: ${targets.join(', ') || '(none)'}`
-  );
-  if (targets.length === 0) return { ok: false };
+  return deliverToWhatsAppNumber(db, phone, {
+    text: opts.caption,
+    pdf: file,
+    fileName: opts.fileName,
+  });
+}
 
-  let deliveredJid: string | undefined;
-  for (const chatId of targets) {
-    const jid = toBaileysJid(chatId);
-    await ensureSendSession(jid);
-    if (opts.caption) {
+/**
+ * Confirm the MSISDN is on WhatsApp and return JIDs to send to.
+ * This account talks on @lid; @s.whatsapp.net sends "succeed" with no delivery.
+ */
+async function resolveWhatsAppJid(
+  s: NonNullable<ReturnType<typeof getWhatsAppSocket>>,
+  db: Db,
+  normalizedPhone: string
+): Promise<{ ok: true; jids: string[] } | { ok: false; detail: string }> {
+  const pnJid = `${normalizedPhone}@s.whatsapp.net`;
+  const last10 = normalizedPhone.slice(-10);
+  let exists = false;
+  const jids: string[] = [];
+  const add = (raw: string | null | undefined) => {
+    if (!raw?.trim()) return;
+    const id = raw.includes('@')
+      ? raw
+      : raw === normalizedPhone
+        ? pnJid
+        : `${raw}@lid`;
+    if (!jids.includes(id)) jids.push(id);
+  };
+
+  const queries = [normalizedPhone, pnJid, `+${normalizedPhone}`];
+  for (const query of queries) {
+    try {
+      const result = await s.onWhatsApp(query);
+      console.log(`[WA] onWhatsApp(${query}) → ${JSON.stringify(result ?? null)}`);
+      const hit = result?.find((row) => row.exists) ?? result?.[0];
+      if (hit?.exists === false) continue;
+      if (hit?.exists) {
+        exists = true;
+        if (hit.jid) add(hit.jid);
+        break;
+      }
+    } catch (err) {
+      console.warn(
+        `[WA] onWhatsApp(${query}) failed`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+  if (!exists) {
+    return { ok: false, detail: 'not_on_whatsapp' };
+  }
+
+  try {
+    const mapped = db
+      .prepare(
+        `SELECT lid, chat_id FROM whatsapp_lid_map
+         WHERE phone = ? OR phone LIKE ?`
+      )
+      .all(normalizedPhone, `%${last10}`) as Array<{
+      lid: string | null;
+      chat_id: string | null;
+    }>;
+    for (const row of mapped) {
+      add(row.lid);
+      add(row.chat_id);
+    }
+  } catch {
+    /* table may be missing */
+  }
+
+  try {
+    const lid = await s.signalRepository.lidMapping.getLIDForPN(pnJid);
+    console.log(`[WA] getLIDForPN(${pnJid}) → ${lid ?? 'null'}`);
+    if (lid) add(lid);
+  } catch (err) {
+    console.warn(
+      `[WA] getLIDForPN failed`,
+      err instanceof Error ? err.message : err
+    );
+  }
+
+  const lids = jids.filter((j) => j.endsWith('@lid') || j.endsWith('@hosted.lid'));
+  const pns = jids.filter((j) => !lids.includes(j));
+  const ordered = [...lids, ...pns];
+  if (ordered.length === 0) ordered.push(pnJid);
+  return { ok: true, jids: ordered };
+}
+
+function persistLidMap(db: Db, phone: string, jid: string): void {
+  if (!jid.endsWith('@lid') && !jid.endsWith('@hosted.lid')) return;
+  try {
+    db.prepare(
+      `INSERT INTO whatsapp_lid_map (id, lid, phone, chat_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+       ON CONFLICT(lid) DO UPDATE SET phone = excluded.phone, updated_at = datetime('now')`
+    ).run(newId('lid'), jid, phone, jid);
+  } catch {
+    /* ignore */
+  }
+}
+
+async function waitForServerAck(
+  s: NonNullable<ReturnType<typeof getWhatsAppSocket>>,
+  messageId: string,
+  timeoutMs = 12_000
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      s.ev.off('messages.update', onUpdate);
+      resolve(false);
+    }, timeoutMs);
+    const onUpdate = (updates: { key?: { id?: string | null }; update?: { status?: number | null } }[]) => {
+      for (const u of updates) {
+        const status = u.update?.status;
+        if (u.key?.id === messageId && typeof status === 'number' && status >= 2) {
+          clearTimeout(timer);
+          s.ev.off('messages.update', onUpdate);
+          resolve(true);
+          return;
+        }
+      }
+    };
+    s.ev.on('messages.update', onUpdate as never);
+  });
+}
+
+/**
+ * Push a message (and optional PDF) to any MSISDN on WhatsApp,
+ * including people who have never chatted with the bot.
+ * Sequence: verify number → send "Hi" → send document.
+ */
+export async function deliverToWhatsAppNumber(
+  db: Db,
+  phone: string,
+  parts: { text?: string; pdf?: Buffer; fileName?: string }
+): Promise<{ ok: boolean; jid?: string; detail: string }> {
+  const normalized = normalizePhone(phone);
+  if (!normalized || normalized.length < 10) {
+    return { ok: false, detail: 'invalid_phone' };
+  }
+
+  const s = getWhatsAppSocket();
+  if (!s) {
+    return { ok: false, detail: 'whatsapp_offline' };
+  }
+
+  const resolved = await resolveWhatsAppJid(s, db, normalized);
+  if (!resolved.ok) {
+    console.warn(`[WA] ${normalized} is not on WhatsApp`);
+    return { ok: false, detail: resolved.detail };
+  }
+
+  console.log(`[WA] ${normalized} send targets: ${resolved.jids.join(', ')}`);
+  await prepareColdRecipient(s, resolved.jids);
+
+  let lastError = 'send_failed';
+  for (const jid of resolved.jids) {
+    persistLidMap(db, normalized, jid);
+    console.log(`[WA] trying receipt delivery via ${jid}`);
+
+    const hi = await s.sendMessage(jid, { text: 'Hi' });
+    const hiId = hi?.key?.id;
+    if (!hiId) {
+      console.error(`[WA] Hi did not send to ${jid}`);
+      lastError = 'send_failed';
+      continue;
+    }
+    console.log(`[WA] Hi sent to ${jid} id=${hiId} remote=${hi?.key?.remoteJid ?? jid}`);
+    const hiAcked = await waitForServerAck(s, hiId, 10_000);
+    console.log(`[WA] Hi server-ack ${jid}: ${hiAcked ? 'yes' : 'timeout'}`);
+
+    if (!hiAcked) {
+      console.warn(`[WA] no ack from ${jid} — trying next target`);
+      lastError = 'send_failed';
+      continue;
+    }
+
+    await sleep(800);
+
+    const caption = parts.text?.trim();
+    if (parts.pdf && parts.fileName) {
       try {
-        await sendText(chatId, opts.caption);
+        const doc = await s.sendMessage(jid, {
+          document: parts.pdf,
+          mimetype: 'application/pdf',
+          fileName: parts.fileName,
+          caption,
+        });
+        const docId = doc?.key?.id;
+        console.log(`[WA] receipt PDF to ${jid} id=${docId ?? 'none'}`);
+        if (docId) {
+          const docAcked = await waitForServerAck(s, docId, 10_000);
+          console.log(`[WA] PDF server-ack ${jid}: ${docAcked ? 'yes' : 'timeout'}`);
+          if (docAcked) {
+            return { ok: true, jid, detail: 'pdf' };
+          }
+        }
       } catch (err) {
-        console.warn(
-          `[WA] vendor text failed ${jid}`,
-          err instanceof Error ? err.message : err
-        );
+        console.error(`[WA] receipt PDF failed for ${jid}:`, err);
       }
     }
-    const ok = await sendDocument(chatId, file, opts);
-    if (ok) deliveredJid = jid;
+
+    if (caption) {
+      const textMsg = await s.sendMessage(jid, { text: caption });
+      if (textMsg?.key?.id) {
+        const textAcked = await waitForServerAck(s, textMsg.key.id, 8_000);
+        if (textAcked) return { ok: true, jid, detail: 'text' };
+      }
+    }
+    lastError = 'send_failed';
   }
-  return { ok: Boolean(deliveredJid), jid: deliveredJid };
+
+  return { ok: false, detail: lastError };
 }
 
 /** @deprecated WAHA webhook config — no-op under Baileys */
@@ -737,13 +1029,31 @@ export async function startWhatsApp(
   fs.mkdirSync(authDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
+  let version: [number, number, number] | undefined;
+  try {
+    const raced = await Promise.race([
+      fetchLatestBaileysVersion(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), 8_000)
+      ),
+    ]);
+    version = raced.version as [number, number, number];
+    console.log(`[WA] Baileys WA version ${version.join('.')}`);
+  } catch {
+    console.warn(
+      '[WA] WhatsApp version fetch timed out — connecting with library default'
+    );
+  }
   const logger = pino({ level: 'silent' });
+  const pairingPhone = env.WA_PAIRING_PHONE
+    ? normalizePhone(env.WA_PAIRING_PHONE)
+    : '';
 
   const connect = async (): Promise<void> => {
     connectionStatus = 'connecting';
+    let pairingRequested = false;
     sock = makeWASocket({
-      version,
+      ...(version ? { version } : {}),
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -762,8 +1072,28 @@ export async function startWhatsApp(
       const { connection, lastDisconnect: ld, qr } = update;
       if (qr) {
         connectionStatus = 'qr';
-        console.log('\n[WA] Scan this QR with WhatsApp → Linked Devices:\n');
-        qrcode.default.generate(qr, { small: true });
+        if (pairingPhone && !state.creds.registered && !pairingRequested) {
+          pairingRequested = true;
+          const s = sock;
+          void (async () => {
+            try {
+              const code = await s!.requestPairingCode(pairingPhone);
+              const pretty = code.replace(/(.{4})/g, '$1-').replace(/-$/, '');
+              console.log('\n[WA] Pairing code (WhatsApp → Linked devices → Link with phone number):\n');
+              console.log(`     ${pretty}\n`);
+              console.log(`     Phone: +${pairingPhone}\n`);
+            } catch (err) {
+              pairingRequested = false;
+              console.error('[WA] pairing code failed', err);
+            }
+          })();
+        } else if (!pairingPhone) {
+          console.log('\n[WA] Scan this QR with WhatsApp → Linked Devices:\n');
+          console.log(
+            '[WA] Windows terminals often render QR as junk. Set WA_PAIRING_PHONE in .env for an 8-digit code instead.\n'
+          );
+          qrcode.default.generate(qr, { small: true });
+        }
       }
       if (connection === 'open') {
         connectionStatus = 'open';
@@ -817,8 +1147,19 @@ export async function startWhatsApp(
 
         const handler = inboundHandler;
         if (!handler) continue;
-        void handler(incoming).catch((err) => {
+        void handler(incoming).catch(async (err) => {
           console.error('[WA] inbound handler error:', err);
+          const msg = err instanceof Error ? err.message : String(err);
+          if (/D1|fetch failed|database/i.test(msg)) {
+            try {
+              await sendText(
+                incoming.from,
+                'Temporary database hiccup. Reply *menu* and try that tap again.'
+              );
+            } catch {
+              /* ignore */
+            }
+          }
         });
       }
     });

@@ -41,6 +41,9 @@ export interface ProductRow {
   low_stock_threshold: number;
   image_url?: string | null;
   images?: string | string[] | null;
+  brand?: string | null;
+  category_id?: string | null;
+  category_name?: string | null;
 }
 
 export interface WalletRow {
@@ -276,6 +279,12 @@ const MARKETPLACE_FROM = `
   JOIN stores s ON s.id = p.store_id
   WHERE IFNULL(p.is_active, 1) = 1
     AND IFNULL(s.is_archived, 0) = 0
+    AND IFNULL((
+      SELECT i.quantity - IFNULL(i.reserved_quantity, 0)
+      FROM inventory i
+      WHERE i.product_id = p.id AND i.variant_id IS NULL
+      LIMIT 1
+    ), 0) > 0
 `;
 
 function marketplaceSearchClause(query?: string): {
@@ -286,8 +295,8 @@ function marketplaceSearchClause(query?: string): {
   if (!term) return { sql: '', params: [] };
   const q = `%${term.replace(/%/g, '')}%`;
   return {
-    sql: ` AND (p.name LIKE ? OR IFNULL(p.description, '') LIKE ? OR s.name LIKE ?)`,
-    params: [q, q, q],
+    sql: ` AND (p.name LIKE ? OR IFNULL(p.description, '') LIKE ? OR IFNULL(p.brand, '') LIKE ? OR s.name LIKE ?)`,
+    params: [q, q, q, q],
   };
 }
 
@@ -339,14 +348,43 @@ export function getProduct(
   db: Db,
   productId: string
 ): (ProductRow & { store_name: string }) | undefined {
-  return db
-    .prepare(
-      `SELECT p.*, s.name AS store_name
+  const sql = `SELECT p.*, s.name AS store_name, c.name AS category_name
        FROM products p
        JOIN stores s ON s.id = p.store_id
-       WHERE p.id = ?`
-    )
+       LEFT JOIN categories c ON c.id = p.category_id`;
+  const exact = db.prepare(`${sql} WHERE p.id = ?`).get(productId) as
+    | (ProductRow & { store_name: string })
+    | undefined;
+  if (exact) return exact;
+  return db
+    .prepare(`${sql} WHERE lower(p.id) = lower(?)`)
     .get(productId) as (ProductRow & { store_name: string }) | undefined;
+}
+
+export function listStoreCategories(
+  db: Db,
+  storeId: string
+): Array<{ id: string; name: string }> {
+  return db
+    .prepare(
+      `SELECT id, name FROM categories WHERE store_id = ? ORDER BY sort_order, name LIMIT 12`
+    )
+    .all(storeId) as Array<{ id: string; name: string }>;
+}
+
+export function createStoreCategory(
+  db: Db,
+  storeId: string,
+  name: string
+): { id: string; name: string } {
+  const id = newId('cat');
+  const ts = nowIso();
+  const trimmed = name.trim().slice(0, 80);
+  db.prepare(
+    `INSERT INTO categories (id, store_id, name, sort_order, created_at, updated_at)
+     VALUES (?, ?, ?, 0, ?, ?)`
+  ).run(id, storeId, trimmed, ts, ts);
+  return { id, name: trimmed };
 }
 
 export function getInventoryQty(db: Db, productId: string): number {

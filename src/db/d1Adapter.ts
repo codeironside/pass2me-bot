@@ -1,8 +1,12 @@
-import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import { Worker } from 'node:worker_threads';
+import dns from 'node:dns';
 import { getEnv } from '../config/env';
+
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  /* older Node */
+}
 
 export interface D1AdapterStatement {
   get(...params: unknown[]): unknown;
@@ -14,6 +18,152 @@ function redact(msg: string): string {
   return msg
     .replace(/Bearer\s+\S+/gi, 'Bearer ***')
     .replace(/cfat_[A-Za-z0-9]+/gi, 'cfat_***');
+}
+
+const WORKER_SOURCE = `
+const { workerData } = require('worker_threads');
+const dns = require('dns');
+try { dns.setDefaultResultOrder('ipv4first'); } catch {}
+
+const control = workerData.control;
+const reqBuf = workerData.reqBuf;
+const reqLen = workerData.reqLen;
+const resBuf = workerData.resBuf;
+const resLen = workerData.resLen;
+
+function readJob() {
+  const n = Atomics.load(reqLen, 0);
+  return JSON.parse(Buffer.from(reqBuf.buffer, reqBuf.byteOffset, n).toString('utf8'));
+}
+
+function writeResult(obj) {
+  const raw = Buffer.from(JSON.stringify(obj), 'utf8');
+  if (raw.length > resBuf.length) {
+    throw new Error('D1 response too large for worker buffer');
+  }
+  raw.copy(Buffer.from(resBuf.buffer, resBuf.byteOffset, resBuf.length));
+  Atomics.store(resLen, 0, raw.length);
+}
+
+async function queryOnce(job) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 25000);
+  try {
+    const res = await fetch(job.url, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + job.token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ sql: job.sql, params: job.params }),
+      signal: ac.signal,
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isRetryable(status, errMsg) {
+  if (errMsg) {
+    const m = errMsg.toLowerCase();
+    if (m.includes('fetch failed') || m.includes('aborted') || m.includes('econn') || m.includes('etimedout') || m.includes('network')) {
+      return true;
+    }
+  }
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+(async function loop() {
+  while (true) {
+    Atomics.wait(control, 0, 0);
+    if (Atomics.load(control, 0) !== 1) continue;
+    try {
+      const job = readJob();
+      let last = { ok: false, status: 0, text: '', error: 'no attempt' };
+      for (let i = 0; i < 4; i++) {
+        try {
+          last = await queryOnce(job);
+          if (last.ok || !isRetryable(last.status, '')) break;
+        } catch (err) {
+          last = { ok: false, status: 0, text: '', error: err instanceof Error ? err.message : String(err) };
+          if (!isRetryable(0, last.error) || i === 3) break;
+        }
+        await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+      }
+      writeResult(last);
+      Atomics.store(control, 0, last.ok || last.text ? 2 : 3);
+    } catch (err) {
+      try {
+        writeResult({ ok: false, status: 0, text: '', error: err instanceof Error ? err.message : String(err) });
+      } catch {}
+      Atomics.store(control, 0, 3);
+    }
+    Atomics.notify(control, 0);
+  }
+})();
+`;
+
+type WorkerBundle = {
+  worker: Worker;
+  control: Int32Array;
+  lock: Int32Array;
+  reqBuf: Uint8Array;
+  reqLen: Int32Array;
+  resBuf: Uint8Array;
+  resLen: Int32Array;
+};
+
+let bundle: WorkerBundle | null = null;
+
+function acquire(lock: Int32Array): void {
+  while (Atomics.compareExchange(lock, 0, 0, 1) !== 0) {
+    Atomics.wait(lock, 0, 1);
+  }
+}
+
+function release(lock: Int32Array): void {
+  Atomics.store(lock, 0, 0);
+  Atomics.notify(lock, 0, 1);
+}
+
+function startWorker(): WorkerBundle {
+  const control = new Int32Array(new SharedArrayBuffer(4));
+  const lock = new Int32Array(new SharedArrayBuffer(4));
+  const reqBuf = new Uint8Array(new SharedArrayBuffer(512 * 1024));
+  const reqLen = new Int32Array(new SharedArrayBuffer(4));
+  const resBuf = new Uint8Array(new SharedArrayBuffer(2 * 1024 * 1024));
+  const resLen = new Int32Array(new SharedArrayBuffer(4));
+
+  const worker = new Worker(WORKER_SOURCE, {
+    eval: true,
+    workerData: { control, reqBuf, reqLen, resBuf, resLen },
+  });
+  worker.on('error', (err) => {
+    console.error('[D1] worker error:', err);
+    bundle = null;
+    try {
+      Atomics.store(control, 0, 3);
+      Atomics.notify(control, 0);
+    } catch {
+      /* ignore */
+    }
+  });
+  worker.on('exit', (code) => {
+    if (code !== 0) {
+      console.error(`[D1] worker exited ${code}`);
+      bundle = null;
+    }
+  });
+
+  return { worker, control, lock, reqBuf, reqLen, resBuf, resLen };
+}
+
+function ensureWorker(): WorkerBundle {
+  if (bundle) return bundle;
+  bundle = startWorker();
+  return bundle;
 }
 
 export class D1DatabaseAdapter {
@@ -46,41 +196,59 @@ export class D1DatabaseAdapter {
     }
 
     const url = `https://api.cloudflare.com/client/v4/accounts/${this.accountId}/d1/database/${this.databaseId}/query`;
-    const payload = JSON.stringify({ sql: sql.trim(), params });
-    const bodyFile = path.join(
-      os.tmpdir(),
-      `pas2me-d1-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
-    );
-    fs.writeFileSync(bodyFile, payload, 'utf8');
+    const job = {
+      url,
+      token: this.apiToken,
+      sql: sql.trim(),
+      params,
+    };
+    const payload = Buffer.from(JSON.stringify(job), 'utf8');
+    const w = ensureWorker();
+    if (payload.length > w.reqBuf.length) {
+      throw new Error('D1 query payload too large');
+    }
 
-    const runner = `
-      const fs = require('fs');
-      const body = fs.readFileSync(${JSON.stringify(bodyFile)}, 'utf8');
-      fetch(${JSON.stringify(url)}, {
-        method: 'POST',
-        headers: {
-          Authorization: ${JSON.stringify(`Bearer ${this.apiToken}`)},
-          'Content-Type': 'application/json',
-        },
-        body,
-      }).then(async (res) => {
-        const text = await res.text();
-        process.stdout.write(text);
-        process.exit(res.ok ? 0 : 2);
-      }).catch((err) => {
-        console.error(err instanceof Error ? err.message : String(err));
-        process.exit(1);
-      });
-    `;
-
+    acquire(w.lock);
     try {
-      const output = execFileSync(process.execPath, ['-e', runner], {
-        encoding: 'utf8',
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 30_000,
-      });
+      payload.copy(Buffer.from(w.reqBuf.buffer, w.reqBuf.byteOffset, w.reqBuf.length));
+      Atomics.store(w.reqLen, 0, payload.length);
+      Atomics.store(w.control, 0, 1);
+      Atomics.notify(w.control, 0);
+      const waited = Atomics.wait(w.control, 0, 1, 35_000);
+      if (waited === 'timed-out') {
+        bundle = null;
+        try {
+          w.worker.terminate();
+        } catch {
+          /* ignore */
+        }
+        throw new Error('Cloudflare D1 execution error: worker timed out');
+      }
 
-      const parsed = JSON.parse(output) as {
+      const n = Atomics.load(w.resLen, 0);
+      const raw = Buffer.from(w.resBuf.buffer, w.resBuf.byteOffset, n).toString('utf8');
+      Atomics.store(w.control, 0, 0);
+
+      const reply = JSON.parse(raw) as {
+        ok?: boolean;
+        status?: number;
+        text?: string;
+        error?: string;
+      };
+
+      if (reply.error && !reply.text) {
+        throw new Error(`Cloudflare D1 execution error: ${reply.error}`);
+      }
+
+      if (!reply.ok) {
+        throw new Error(
+          redact(
+            `Cloudflare D1 execution error: HTTP ${reply.status ?? 0} ${String(reply.text ?? reply.error ?? '').slice(0, 400)}`
+          )
+        );
+      }
+
+      const parsed = JSON.parse(reply.text || '{}') as {
         success: boolean;
         result?: Array<{
           results: unknown[];
@@ -103,27 +271,8 @@ export class D1DatabaseAdapter {
         results: parsed.result[0].results || [],
         meta: parsed.result[0].meta || {},
       };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const extra =
-        err && typeof err === 'object' && 'stdout' in err
-          ? String((err as { stdout?: string }).stdout ?? '')
-          : '';
-      const stderr =
-        err && typeof err === 'object' && 'stderr' in err
-          ? String((err as { stderr?: string }).stderr ?? '')
-          : '';
-      throw new Error(
-        redact(
-          `Cloudflare D1 execution error: ${msg}${extra ? ` | ${extra.slice(0, 500)}` : ''}${stderr ? ` | ${stderr.slice(0, 300)}` : ''}`
-        )
-      );
     } finally {
-      try {
-        fs.unlinkSync(bodyFile);
-      } catch {
-        /* ignore */
-      }
+      release(w.lock);
     }
   }
 
@@ -156,10 +305,14 @@ export class D1DatabaseAdapter {
   }
 
   public exec(sql: string): void {
-    const chunks = sql
+    const withoutLineComments = sql
+      .split(/\r?\n/)
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n');
+    const chunks = withoutLineComments
       .split(';')
       .map((s) => s.trim())
-      .filter((s) => s.length > 0 && !s.startsWith('--'));
+      .filter((s) => s.length > 0);
     if (chunks.length === 0) return;
     for (const chunk of chunks) {
       this.executeSync(chunk, []);
@@ -171,11 +324,17 @@ export class D1DatabaseAdapter {
   }
 
   public transaction<T extends (...args: unknown[]) => unknown>(fn: T): T {
-    // D1 REST cannot hold a transaction across separate HTTP calls.
     return ((...args: unknown[]) => fn(...args)) as T;
   }
 
   public close(): void {
-    // No-op for D1 REST connection
+    if (bundle) {
+      try {
+        bundle.worker.terminate();
+      } catch {
+        /* ignore */
+      }
+      bundle = null;
+    }
   }
 }

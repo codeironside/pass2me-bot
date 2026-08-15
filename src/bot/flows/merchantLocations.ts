@@ -39,8 +39,8 @@ async function goMerchantHome(
   identity: ResolvedIdentity,
   db: Db
 ): Promise<void> {
-  const mod = await import('./merchant');
-  await mod.sendMerchantHome(chatId, identity, db);
+  const { openInventoryHub } = await import('./merchantInventory');
+  await openInventoryHub(db, identity, chatId);
 }
 
 type LocRoles = {
@@ -124,12 +124,9 @@ async function sendCoverPreview(
   }
 }
 
+/** Any signed-up user can create their own store. */
 export function canCreateStore(identity: ResolvedIdentity): boolean {
-  return Boolean(
-    identity.isSuperAdmin ||
-      identity.user?.role === 'admin' ||
-      identity.user?.role === 'merchant'
-  );
+  return Boolean(identity.user) || identity.isSuperAdmin;
 }
 
 export async function startCreateStore(
@@ -140,7 +137,11 @@ export async function startCreateStore(
   if (!canCreateStore(identity) || !identity.user) {
     await sendText(
       chatId,
-      'Only registered merchants/admins can create locations.'
+      [
+        'To create a store you need a Pas2me account.',
+        'Sign up at https://www.pas2me.com with this WhatsApp number,',
+        'then reply *create store*.',
+      ].join('\n')
     );
     return;
   }
@@ -163,6 +164,7 @@ export async function startCreateStore(
   const conv = getOrCreateConversation(db, identity.phone);
   const ctx = getContext(conv);
   updateConversation(db, identity.phone, {
+    mode: 'merchant',
     state: 'merch_store_name',
     context_json: JSON.stringify(clearCreateCtx(ctx)),
   });
@@ -477,6 +479,13 @@ async function finalizeCreateStore(
         lng,
         address,
       });
+    }
+
+    if (identity.user.role !== 'admin') {
+      db.prepare(
+        `UPDATE users SET role = 'merchant', updated_at = ? WHERE id = ?`
+      ).run(ts, identity.user.id);
+      identity.user.role = 'merchant';
     }
 
     writeBotAudit(db, {

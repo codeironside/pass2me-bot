@@ -3,6 +3,8 @@ import {
   getContext,
   getOrCreateConversation,
   getStore,
+  listStoreCategories,
+  createStoreCategory,
   updateConversation,
   writeBotAudit,
 } from '../../db/repos';
@@ -13,15 +15,19 @@ import {
   nairaToKobo,
 } from '../../domain/money';
 import { newId, nowIso } from '../../domain/ids';
-import { sendList, sendMenuMessage, sendText } from '../../services/whatsapp';
+import { sendImage, sendList, sendMenuMessage, sendText } from '../../services/whatsapp';
 import type { IncomingWahaMessage } from '../../services/whatsapp';
 import { applyLedgerEntry } from '../../services/wallet';
 import {
   assertWithinLimit,
   getPlanFeatures,
-  usageWarning,
   type SubscriptionPlan,
 } from '../../guardrails/plans';
+import {
+  downloadInboundImage,
+  loadCoverBytes,
+  saveProductPhoto,
+} from '../../services/media';
 import {
   canAdjustStock,
   canManageRefunds,
@@ -36,6 +42,9 @@ import {
   handleManageLocationsEntry,
   startCreateStore,
 } from './merchantLocations';
+import {
+  handleInventoryMessage,
+} from './merchantInventory';
 
 const MERCHANT_MENU: MenuOption[] = [
   { id: 'merch_orders', label: 'Orders' },
@@ -104,7 +113,7 @@ export async function sendMerchantHome(
   }
   await sendMenuMessage(
     chatId,
-    `*Merchant menu*\nLocations linked: ${storeCount}${identity.isSuperAdmin ? ' · superadmin' : ''}\nManage stores, stock, orders, and stats.`,
+    `*Merchant menu*\nLocations linked: ${storeCount}${identity.isSuperAdmin ? ' · superadmin' : ''}\n${storeCount === 0 ? 'Create a store first — products must belong to a store.' : 'Manage stores, stock, orders, and stats.'}`,
     menu.map((o) => ({ id: o.id, text: o.label }))
   );
 }
@@ -125,7 +134,37 @@ export async function handleMerchantMessage(
     text,
     interactiveId,
     lastMenu: lastMenu(db, phone),
+    ignoreNumericMenu:
+      conv.state === 'merch_inv_sell_qty' ||
+      conv.state === 'merch_inv_sell_phone' ||
+      conv.state === 'merch_inv_receive' ||
+      conv.state === 'merch_inv_set' ||
+      conv.state === 'merch_inv_edit_price' ||
+      conv.state === 'merch_inv_edit_name',
   });
+
+  if (conv.state.startsWith('merch_inv_')) {
+    if (
+      await handleInventoryMessage(
+        db,
+        identity,
+        chatId,
+        conv.selected_store_id ?? undefined,
+        text,
+        interactiveId,
+        inbound
+      )
+    ) {
+      return;
+    }
+  }
+
+  if (cmd === 'cust_home') {
+    updateConversation(db, phone, { mode: 'customer', state: 'idle' });
+    const { sendCustomerHome } = await import('./customer');
+    await sendCustomerHome(db, chatId, identity);
+    return;
+  }
 
   if (
     cmd === 'merch_home' ||
@@ -143,6 +182,7 @@ export async function handleMerchantMessage(
       conv.state.startsWith('merch_waybill') ||
       conv.state.startsWith('merch_batch') ||
       conv.state.startsWith('merch_sync') ||
+      conv.state.startsWith('merch_inv_') ||
       conv.state.startsWith('merch_stock_') ||
       conv.state.startsWith('merch_sale_') ||
       conv.state.startsWith('merch_refund_')
@@ -156,6 +196,10 @@ export async function handleMerchantMessage(
           new_product_price_naira: null,
           new_product_description: null,
           new_product_qty: null,
+          new_product_image_url: null,
+          new_product_brand: null,
+          new_product_category_id: null,
+          new_product_category_name: null,
           new_store_name: null,
           new_store_description: null,
           new_store_banner_url: null,
@@ -284,16 +328,25 @@ export async function handleMerchantMessage(
     }
   }
 
+  if (
+    await handleInventoryMessage(
+      db,
+      identity,
+      chatId,
+      conv.selected_store_id ?? undefined,
+      text,
+      interactiveId,
+      inbound
+    )
+  ) {
+    return;
+  }
+
   const storeId = await resolveActiveStore(db, identity, chatId);
   if (!storeId) return;
 
   if (cmd === 'merch_orders' || lower === 'orders') {
     await listOrders(db, identity, chatId, storeId);
-    return;
-  }
-
-  if (cmd === 'merch_stock' || lower === 'stock' || lower === 'products') {
-    await listStock(db, identity, chatId, storeId);
     return;
   }
 
@@ -308,7 +361,16 @@ export async function handleMerchantMessage(
   }
 
   if (conv.state.startsWith('merch_product_')) {
-    await continueAddProduct(db, identity, chatId, storeId, text, lower);
+    await continueAddProduct(
+      db,
+      identity,
+      chatId,
+      storeId,
+      text,
+      lower,
+      inbound,
+      interactiveId
+    );
     return;
   }
 
@@ -496,50 +558,6 @@ async function listOrders(
   void identity;
 }
 
-async function listStock(
-  db: Db,
-  identity: ResolvedIdentity,
-  chatId: string,
-  storeId: string
-): Promise<void> {
-  const store = getStore(db, storeId);
-  if (!store) return;
-  const features = getPlanFeatures(store.subscription_plan as SubscriptionPlan);
-  const count = (
-    db
-      .prepare('SELECT COUNT(*) AS c FROM products WHERE store_id = ?')
-      .get(storeId) as { c: number }
-  ).c;
-  const warn = usageWarning(count, features.max_products);
-
-  const products = db
-    .prepare(
-      `SELECT p.id, p.name, p.price, IFNULL(i.quantity, 0) AS qty
-       FROM products p
-       LEFT JOIN inventory i ON i.product_id = p.id AND i.variant_id IS NULL
-       WHERE p.store_id = ?
-       ORDER BY p.updated_at DESC
-       LIMIT 10`
-    )
-    .all(storeId) as Array<{
-    id: string;
-    name: string;
-    price: number | string;
-    qty: number;
-  }>;
-
-  const lines = products.map(
-    (p) =>
-      `• ${p.name} (${p.id.slice(0, 8)}…) qty=${p.qty} ${formatNgn(decimalToKobo(p.price))}`
-  );
-  if (warn) lines.unshift(warn, '');
-  lines.push('', 'Reply *add product* to create a product.');
-  lines.push('Set stock: stock <product_id> <qty>');
-  lines.push('Record sale: sale <product_id> <qty>');
-  await sendText(chatId, lines.join('\n') || 'No products.\nReply *add product* to create one.');
-  void identity;
-}
-
 async function startAddProduct(
   db: Db,
   identity: ResolvedIdentity,
@@ -579,12 +597,121 @@ async function startAddProduct(
       new_product_price_naira: null,
       new_product_description: null,
       new_product_qty: null,
+      new_product_image_url: null,
+      new_product_brand: null,
+      new_product_category_id: null,
+      new_product_category_name: null,
     }),
   });
   await sendText(
     chatId,
-    'Create product — step 1/4\nEnter the *product name*:\n(or reply *cancel*)'
+    'Create product — step 1/7\nEnter the *product name*:\n(or reply *cancel*)'
   );
+}
+
+async function promptProductCategory(
+  db: Db,
+  identity: ResolvedIdentity,
+  chatId: string,
+  storeId: string,
+  brand: string | null
+): Promise<void> {
+  const cats = listStoreCategories(db, storeId);
+  const options: MenuOption[] = cats.map((c) => ({
+    id: `cat_${c.id}`,
+    label: c.name.slice(0, 28),
+  }));
+  options.push({ id: 'cat_new', label: 'New category' });
+  options.push({ id: 'cat_skip', label: 'Skip' });
+  rememberMenu(db, identity.phone, options);
+  const brandLine = brand ? `Brand: *${brand}*\n` : '';
+  await sendMenuMessage(
+    chatId,
+    `${brandLine}Step 4/7 — Pick a *category*, type a new name, or skip:`,
+    options.map((o) => ({ id: o.id, text: o.label }))
+  );
+}
+
+async function goProductDescription(
+  db: Db,
+  phone: string,
+  chatId: string,
+  ctx: Record<string, unknown>,
+  categoryId: string | null,
+  categoryName: string | null
+): Promise<void> {
+  updateConversation(db, phone, {
+    state: 'merch_product_desc',
+    context_json: JSON.stringify({
+      ...ctx,
+      new_product_category_id: categoryId,
+      new_product_category_name: categoryName,
+    }),
+  });
+  const catNote = categoryName ? `Category: *${categoryName}*\n` : '';
+  await sendText(
+    chatId,
+    `${catNote}Step 5/7 — Enter a *description*, or reply *-* to skip:`
+  );
+}
+
+async function handleProductCategoryReply(
+  db: Db,
+  identity: ResolvedIdentity,
+  chatId: string,
+  storeId: string,
+  text: string,
+  lower: string,
+  interactiveId?: string
+): Promise<boolean> {
+  const phone = identity.phone;
+  const conv = getOrCreateConversation(db, phone);
+  const ctx = getContext(conv);
+  const cmd = resolveCommand({
+    text,
+    interactiveId,
+    lastMenu: lastMenu(db, phone),
+  });
+
+  if (conv.state === 'merch_product_category_new') {
+    const name = text.trim();
+    if (name.length < 2) {
+      await sendText(chatId, 'Category name is too short. Try again:');
+      return true;
+    }
+    const created = createStoreCategory(db, storeId, name);
+    await goProductDescription(db, phone, chatId, ctx, created.id, created.name);
+    return true;
+  }
+
+  if (cmd === 'cat_skip' || lower === '-' || lower === 'skip' || lower === 'none') {
+    await goProductDescription(db, phone, chatId, ctx, null, null);
+    return true;
+  }
+  if (cmd === 'cat_new' || lower === 'new category') {
+    updateConversation(db, phone, { state: 'merch_product_category_new' });
+    await sendText(chatId, 'Type the *new category name*:');
+    return true;
+  }
+  if (cmd.startsWith('cat_')) {
+    const id = cmd.slice(4);
+    const match = listStoreCategories(db, storeId).find((c) => c.id === id);
+    if (!match) {
+      await sendText(chatId, 'Pick a category from the list, type a name, or *skip*.');
+      return true;
+    }
+    await goProductDescription(db, phone, chatId, ctx, match.id, match.name);
+    return true;
+  }
+
+  const typed = text.trim();
+  if (typed.length >= 2) {
+    const created = createStoreCategory(db, storeId, typed);
+    await goProductDescription(db, phone, chatId, ctx, created.id, created.name);
+    return true;
+  }
+  await sendText(chatId, 'Pick a category, type a name, or reply *skip*.');
+  return true;
 }
 
 async function continueAddProduct(
@@ -593,7 +720,9 @@ async function continueAddProduct(
   chatId: string,
   storeId: string,
   text: string,
-  lower: string
+  lower: string,
+  inbound?: IncomingWahaMessage,
+  interactiveId?: string
 ): Promise<void> {
   const phone = identity.phone;
   const conv = getOrCreateConversation(db, phone);
@@ -608,6 +737,10 @@ async function continueAddProduct(
         new_product_price_naira: null,
         new_product_description: null,
         new_product_qty: null,
+        new_product_image_url: null,
+        new_product_brand: null,
+        new_product_category_id: null,
+        new_product_category_name: null,
       }),
     });
     await sendText(chatId, 'Product creation cancelled.');
@@ -637,7 +770,7 @@ async function continueAddProduct(
     });
     await sendText(
       chatId,
-      `Name: *${name}*\nStep 2/4 — Enter *price in Naira* (e.g. 2500):`
+      `Name: *${name}*\nStep 2/7 — Enter *price in Naira* (e.g. 2500):`
     );
     return;
   }
@@ -656,7 +789,7 @@ async function continueAddProduct(
     }
     const priceNaira = koboToNairaString(priceKobo);
     updateConversation(db, phone, {
-      state: 'merch_product_desc',
+      state: 'merch_product_brand',
       context_json: JSON.stringify({
         ...ctx,
         new_product_price_naira: priceNaira,
@@ -664,9 +797,47 @@ async function continueAddProduct(
     });
     await sendText(
       chatId,
-      `Price: *${formatNgn(priceKobo)}*\nStep 3/4 — Enter a *description*, or reply *-* to skip:`
+      `Price: *${formatNgn(priceKobo)}*\nStep 3/7 — Enter the *brand* (e.g. Nike), or reply *-* to skip:`
     );
     return;
+  }
+
+  if (conv.state === 'merch_product_brand') {
+    const brand =
+      lower === '-' || lower === 'skip' || lower === 'none'
+        ? null
+        : text.trim().slice(0, 80);
+    if (brand && brand.length < 2) {
+      await sendText(chatId, 'Brand is too short. Enter a brand, or *-* to skip:');
+      return;
+    }
+    updateConversation(db, phone, {
+      state: 'merch_product_category',
+      context_json: JSON.stringify({
+        ...ctx,
+        new_product_brand: brand,
+        new_product_category_id: null,
+        new_product_category_name: null,
+      }),
+    });
+    await promptProductCategory(db, identity, chatId, storeId, brand);
+    return;
+  }
+
+  if (
+    conv.state === 'merch_product_category' ||
+    conv.state === 'merch_product_category_new'
+  ) {
+    const handled = await handleProductCategoryReply(
+      db,
+      identity,
+      chatId,
+      storeId,
+      text,
+      lower,
+      interactiveId
+    );
+    if (handled) return;
   }
 
   if (conv.state === 'merch_product_desc') {
@@ -675,15 +846,61 @@ async function continueAddProduct(
         ? null
         : text.trim().slice(0, 500);
     updateConversation(db, phone, {
-      state: 'merch_product_qty',
+      state: 'merch_product_photo',
       context_json: JSON.stringify({
         ...ctx,
         new_product_description: description,
+        new_product_image_url: null,
       }),
     });
     await sendText(
       chatId,
-      'Step 4/4 — Enter *starting stock quantity* (e.g. 10):'
+      [
+        'Step 6/7 — Add a *product photo* (customers see this when browsing):',
+        '• Send a photo here',
+        '• Or paste an https image URL',
+        '• Or reply *-* to skip',
+      ].join('\n')
+    );
+    return;
+  }
+
+  if (conv.state === 'merch_product_photo') {
+    const skip =
+      lower === '-' || lower === 'skip' || lower === 'none' || lower === 'no';
+    let imageUrl: string | null = null;
+    if (!skip) {
+      const urlCandidate = text.trim();
+      if (/^https?:\/\//i.test(urlCandidate)) {
+        imageUrl = urlCandidate.slice(0, 500);
+      } else if (inbound?.hasMedia) {
+        const image = await downloadInboundImage(inbound);
+        if (!image) {
+          await sendText(
+            chatId,
+            'Could not download that image. Send a photo, paste an https URL, or reply *-* to skip:'
+          );
+          return;
+        }
+        imageUrl = await saveProductPhoto(image.buffer, image.ext);
+      } else {
+        await sendText(
+          chatId,
+          'Send a *photo*, paste an *https* image URL, or reply *-* to skip:'
+        );
+        return;
+      }
+    }
+    updateConversation(db, phone, {
+      state: 'merch_product_qty',
+      context_json: JSON.stringify({
+        ...ctx,
+        new_product_image_url: imageUrl,
+      }),
+    });
+    await sendText(
+      chatId,
+      'Step 7/7 — Enter *stock quantity* (how many units you have, e.g. 10).\nBuyers will not see this product if quantity is 0.'
     );
     return;
   }
@@ -691,7 +908,10 @@ async function continueAddProduct(
   if (conv.state === 'merch_product_qty') {
     const qty = Number(text.trim());
     if (!Number.isInteger(qty) || qty < 0) {
-      await sendText(chatId, 'Enter a whole number ≥ 0 for stock.');
+      await sendText(
+        chatId,
+        'Enter a whole number ≥ 0 for stock. Use 0 if you are not ready to sell yet (buyers will not see it).'
+      );
       return;
     }
     updateConversation(db, phone, {
@@ -706,18 +926,34 @@ async function continueAddProduct(
     const desc = ctx.new_product_description
       ? String(ctx.new_product_description)
       : '(none)';
-    await sendText(
-      chatId,
-      [
-        `Confirm new product:`,
-        `*${name}*`,
-        `Price: ${formatNgn(decimalToKobo(priceNaira))}`,
-        `Stock: ${qty}`,
-        `Description: ${desc}`,
-        ``,
-        `Reply *YES* to create or *NO* to cancel.`,
-      ].join('\n')
-    );
+    const photo = ctx.new_product_image_url
+      ? 'photo attached'
+      : 'no photo';
+    const caption = [
+      `Confirm new product:`,
+      `*${name}*`,
+      ctx.new_product_brand ? `Brand: ${ctx.new_product_brand}` : 'Brand: (none)',
+      ctx.new_product_category_name
+        ? `Category: ${ctx.new_product_category_name}`
+        : 'Category: (none)',
+      `Price: ${formatNgn(decimalToKobo(priceNaira))}`,
+      `Stock: ${qty}${qty < 1 ? ' (hidden from buyers until you add stock)' : ''}`,
+      `Photo: ${photo}`,
+      `Description: ${desc}`,
+      ``,
+      `Reply *YES* to create or *NO* to cancel.`,
+    ].join('\n');
+    const imageUrl =
+      typeof ctx.new_product_image_url === 'string'
+        ? ctx.new_product_image_url
+        : null;
+    if (imageUrl) {
+      const bytes = await loadCoverBytes(imageUrl);
+      if (bytes) await sendImage(chatId, bytes, caption);
+      else await sendText(chatId, caption);
+    } else {
+      await sendText(chatId, caption);
+    }
     return;
   }
 
@@ -740,6 +976,17 @@ async function continueAddProduct(
         ? ctx.new_product_description
         : null;
     const qty = Number(ctx.new_product_qty ?? 0);
+    const imageUrl =
+      typeof ctx.new_product_image_url === 'string'
+        ? ctx.new_product_image_url
+        : null;
+    const imagesJson = imageUrl ? JSON.stringify([imageUrl]) : null;
+    const brand =
+      typeof ctx.new_product_brand === 'string' ? ctx.new_product_brand : null;
+    const categoryId =
+      typeof ctx.new_product_category_id === 'string'
+        ? ctx.new_product_category_id
+        : null;
     if (!name || !priceNaira) {
       await sendText(chatId, 'Session expired. Start again with *add product*.');
       updateConversation(db, phone, { state: 'idle' });
@@ -773,15 +1020,18 @@ async function continueAddProduct(
       const run = db.transaction(() => {
         db.prepare(
           `INSERT INTO products
-            (id, store_id, name, description, price, is_active, is_featured,
+            (id, store_id, category_id, name, description, price, brand, images, is_active, is_featured,
              inventory_tracking, low_stock_threshold, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 1, 0, 1, 5, ?, ?)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1, 5, ?, ?)`
         ).run(
           productId,
           storeId,
+          categoryId,
           name,
           description,
           priceNum,
+          brand,
+          imagesJson,
           ts,
           ts
         );
@@ -832,22 +1082,38 @@ async function continueAddProduct(
         new_product_price_naira: null,
         new_product_description: null,
         new_product_qty: null,
+        new_product_image_url: null,
+        new_product_brand: null,
+        new_product_category_id: null,
+        new_product_category_name: null,
       }),
     });
 
-    await sendText(
-      chatId,
-      [
-        `*Product created*`,
-        `*${name}*`,
-        `Price: ${formatNgn(decimalToKobo(priceNaira))}`,
-        `Stock: ${qty}`,
-        `ID: \`${productId}\``,
-        ``,
-        `Customers can find it via *browse* / *search*.`,
-        `Update stock later: stock ${productId} <qty>`,
-      ].join('\n')
-    );
+    const createdCaption = [
+      `*Product created*`,
+      `*${name}*`,
+      brand ? `Brand: ${brand}` : '',
+      ctx.new_product_category_name
+        ? `Category: ${ctx.new_product_category_name}`
+        : '',
+      `Price: ${formatNgn(decimalToKobo(priceNaira))}`,
+      `Stock: ${qty}${qty < 1 ? ' (hidden from buyers)' : ''}`,
+      `ID: \`${productId}\``,
+      ``,
+      qty < 1
+        ? `Add stock with *stock* before customers can see it.`
+        : `Customers can find it via *marketplace* / *search*.`,
+      `Edit anytime from *stock* → pick the product → *Edit details*.`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    if (imageUrl) {
+      const bytes = await loadCoverBytes(imageUrl);
+      if (bytes) await sendImage(chatId, bytes, createdCaption);
+      else await sendText(chatId, createdCaption);
+    } else {
+      await sendText(chatId, createdCaption);
+    }
     await sendMerchantHome(chatId, identity, db);
   }
 }
@@ -1227,9 +1493,23 @@ async function recordSale(
     )
     .get(productId) as { id: string; quantity: number } | undefined;
   if (inv) {
+    const nextQty = Math.max(0, inv.quantity - qty);
     db.prepare(
       `UPDATE inventory SET quantity = ?, updated_at = ? WHERE id = ?`
-    ).run(Math.max(0, inv.quantity - qty), nowIso(), inv.id);
+    ).run(nextQty, nowIso(), inv.id);
+    db.prepare(
+      `INSERT INTO inventory_movements
+        (id, product_id, previous_quantity, new_quantity, change_amount, reason, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, 'pos_sale', ?, ?)`
+    ).run(
+      newId('im'),
+      productId,
+      inv.quantity,
+      nextQty,
+      nextQty - inv.quantity,
+      identity.user?.id ?? null,
+      nowIso()
+    );
   }
 
   if (store.user_id) {

@@ -6,10 +6,16 @@ import type { IncomingWahaMessage } from './whatsapp';
 import { getWhatsAppSocket } from './whatsapp';
 
 const COVER_DIR = path.resolve(process.cwd(), 'data', 'store-covers');
+const PRODUCT_DIR = path.resolve(process.cwd(), 'data', 'product-photos');
 
 export function ensureStoreCoverDir(): string {
   fs.mkdirSync(COVER_DIR, { recursive: true });
   return COVER_DIR;
+}
+
+export function ensureProductPhotoDir(): string {
+  fs.mkdirSync(PRODUCT_DIR, { recursive: true });
+  return PRODUCT_DIR;
 }
 
 export function storeCoverPublicPath(): string {
@@ -30,17 +36,100 @@ export async function saveStoreCover(
   return `${base}/media/store-covers/${filename}`;
 }
 
-/** Resolve a stored cover URL back to a local file path when we host it. */
-export function localPathFromCoverUrl(url: string): string | null {
-  const marker = '/media/store-covers/';
-  const idx = url.indexOf(marker);
-  if (idx === -1) return null;
-  const filename = (url.slice(idx + marker.length).split('?')[0] ?? '').trim();
-  if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+/** Persist a product photo and return a public URL the website can load. */
+export async function saveProductPhoto(
+  buffer: Buffer,
+  ext: string
+): Promise<string> {
+  const safeExt = ext.replace(/[^a-z0-9]/gi, '') || 'jpg';
+  const filename = `${newId('pimg')}.${safeExt}`;
+  const mime =
+    safeExt === 'png'
+      ? 'image/png'
+      : safeExt === 'webp'
+        ? 'image/webp'
+        : safeExt === 'gif'
+          ? 'image/gif'
+          : 'image/jpeg';
+  const hosted = await uploadPublicObject(
+    `products/${filename}`,
+    buffer,
+    mime
+  );
+  if (hosted) return hosted;
+
+  ensureProductPhotoDir();
+  const filePath = path.join(PRODUCT_DIR, filename);
+  await fs.promises.writeFile(filePath, buffer);
+  const base = getEnv().BOT_PUBLIC_URL.replace(/\/$/, '');
+  console.warn(
+    '[media] product photo saved locally only — website cannot load this URL. Set R2_PUBLIC_BASE_URL and Cloudflare R2 credentials.'
+  );
+  return `${base}/media/product-photos/${filename}`;
+}
+
+async function uploadPublicObject(
+  key: string,
+  buffer: Buffer,
+  contentType: string
+): Promise<string | null> {
+  const env = getEnv();
+  const accountId = env.R2_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID;
+  const token = env.CLOUDFLARE_API_TOKEN;
+  const bucket = env.R2_BUCKET || 'pas2me-storage';
+  const publicBase = env.R2_PUBLIC_BASE_URL?.replace(/\/$/, '');
+  if (!accountId || !token || !publicBase) return null;
+
+  const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${bucket}/objects/${key}`;
+  try {
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': contentType,
+      },
+      body: new Uint8Array(buffer),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(
+        `[media] R2 upload failed ${res.status} ${text.slice(0, 300)}`
+      );
+      return null;
+    }
+    return `${publicBase}/${key}`;
+  } catch (err) {
+    console.error('[media] R2 upload error', err);
     return null;
   }
-  const full = path.join(COVER_DIR, filename);
-  return fs.existsSync(full) ? full : null;
+}
+
+function localPathFromMediaUrl(url: string): string | null {
+  const maps: Array<{ marker: string; dir: string }> = [
+    { marker: '/media/store-covers/', dir: COVER_DIR },
+    { marker: '/media/product-photos/', dir: PRODUCT_DIR },
+  ];
+  for (const { marker, dir } of maps) {
+    const idx = url.indexOf(marker);
+    if (idx === -1) continue;
+    const filename = (url.slice(idx + marker.length).split('?')[0] ?? '').trim();
+    if (
+      !filename ||
+      filename.includes('..') ||
+      filename.includes('/') ||
+      filename.includes('\\')
+    ) {
+      return null;
+    }
+    const full = path.join(dir, filename);
+    if (fs.existsSync(full)) return full;
+  }
+  return null;
+}
+
+/** Resolve a stored cover/product URL back to a local file path when we host it. */
+export function localPathFromCoverUrl(url: string): string | null {
+  return localPathFromMediaUrl(url);
 }
 
 /** Load cover bytes for WhatsApp send (local file preferred; else fetch http URL). */

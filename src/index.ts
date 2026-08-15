@@ -5,7 +5,7 @@ import { loadEnv } from './config/env';
 import { getDb, runMigrations } from './db/client';
 import { createHttpRouter } from './http/routes';
 import { startWhatsApp } from './services/whatsapp';
-import { ensureStoreCoverDir } from './services/media';
+import { ensureProductPhotoDir, ensureStoreCoverDir } from './services/media';
 import { handleIncomingWhatsAppMessage } from './bot/router';
 import { startMonnifyDepositPoller } from './services/monnifyPoll';
 
@@ -23,6 +23,13 @@ async function main(): Promise<void> {
   app.use(
     '/media/store-covers',
     express.static(ensureStoreCoverDir(), {
+      maxAge: '7d',
+      fallthrough: false,
+    })
+  );
+  app.use(
+    '/media/product-photos',
+    express.static(ensureProductPhotoDir(), {
       maxAge: '7d',
       fallthrough: false,
     })
@@ -56,6 +63,9 @@ async function main(): Promise<void> {
     );
     console.log(
       `Store covers=${path.resolve(process.cwd(), 'data', 'store-covers')}`
+    );
+    console.log(
+      `Product photos=${path.resolve(process.cwd(), 'data', 'product-photos')}`
     );
     console.log(
       `Monnify webhook (instant):\n  ${env.BOT_PUBLIC_URL}/webhooks/monnify`

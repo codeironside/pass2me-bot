@@ -15,6 +15,17 @@ export interface ReservedAccountResult {
   accountNumber: string;
   accountReference: string;
   bankName?: string;
+  accountName?: string;
+  raw: unknown;
+}
+
+export interface BankTransferCharge {
+  reference: string;
+  accountNumber?: string;
+  accountName?: string;
+  bankName?: string;
+  expiresOn?: string;
+  checkoutUrl?: string;
   raw: unknown;
 }
 
@@ -100,15 +111,18 @@ function extractReservedAccount(raw: unknown): {
   accountNumber: string;
   accountReference: string;
   bankName?: string;
+  accountName?: string;
 } {
   const root = asRecord(raw);
   const body = asRecord(root.responseBody ?? root.data ?? root);
   const accounts = Array.isArray(body.accounts) ? body.accounts : [];
   const firstAccount = asRecord(accounts[0]);
+  const transfer = asRecord(body.bankTransfer ?? body.accountDetails ?? body);
 
   const accountNumber = String(
     body.accountNumber ??
       firstAccount.accountNumber ??
+      transfer.accountNumber ??
       body.account_number ??
       ''
   ).trim();
@@ -116,13 +130,20 @@ function extractReservedAccount(raw: unknown): {
     body.accountReference ?? body.account_reference ?? ''
   ).trim();
   const bankName = String(
-    body.bankName ?? firstAccount.bankName ?? ''
+    body.bankName ?? firstAccount.bankName ?? transfer.bankName ?? ''
+  ).trim();
+  const accountName = String(
+    body.accountName ??
+      firstAccount.accountName ??
+      transfer.accountName ??
+      ''
   ).trim();
 
   return {
     accountNumber,
     accountReference,
     bankName: bankName || undefined,
+    accountName: accountName || undefined,
   };
 }
 
@@ -203,6 +224,92 @@ export async function createCheckout(params: {
       raw: { error: String(err) },
     };
   }
+}
+
+/** One-time virtual account for bank-transfer checkout (shows account number). */
+export async function createBankTransferCharge(params: {
+  amount: Kobo;
+  customerPhone: string;
+  customerEmail?: string;
+  customerName?: string;
+  description: string;
+  reference: string;
+  callbackUrl: string;
+}): Promise<BankTransferCharge> {
+  const env = getEnv();
+  const customerName =
+    params.customerName?.trim() || params.customerPhone;
+  const customerEmail =
+    params.customerEmail ??
+    `${params.customerPhone.replace(/\D/g, '')}@pas2me.local`;
+
+  if (!monnifyConfigured()) {
+    return {
+      reference: params.reference,
+      checkoutUrl: `${env.BOT_PUBLIC_URL}/pay/${params.reference}`,
+      raw: { mock: true },
+    };
+  }
+
+  const payload = {
+    amount: Number(koboToNairaString(params.amount)),
+    currencyCode: 'NGN',
+    paymentDescription: params.description,
+    paymentReference: params.reference,
+    contractCode: env.MONNIFY_CONTRACT_CODE,
+    customerName,
+    customerEmail,
+    redirectUrl: params.callbackUrl.includes('/webhooks/')
+      ? `${env.BOT_PUBLIC_URL}/pay/${params.reference}`
+      : params.callbackUrl,
+  };
+
+  try {
+    const res = await monnifyFetch(
+      '/api/v1/merchant/bank-transfer/init-payment',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    );
+    const json = (await res.json().catch(async () => ({
+      text: await res.text(),
+    }))) as Record<string, unknown>;
+
+    if (res.ok && json.requestSuccessful !== false) {
+      const extracted = extractReservedAccount(json);
+      const data = asRecord(json.responseBody ?? json.data ?? json);
+      if (extracted.accountNumber) {
+        return {
+          reference: params.reference,
+          accountNumber: extracted.accountNumber,
+          accountName: extracted.accountName,
+          bankName: extracted.bankName,
+          expiresOn: data.expiresOn ? String(data.expiresOn) : undefined,
+          raw: json,
+        };
+      }
+    } else {
+      console.error('Monnify bank-transfer init failed:', json);
+    }
+  } catch (err) {
+    console.error('Monnify bank-transfer init error:', err);
+  }
+
+  const checkout = await createCheckout({
+    ...params,
+    customerName,
+    customerEmail,
+  });
+  const extracted = extractReservedAccount(checkout.raw);
+  return {
+    reference: params.reference,
+    accountNumber: extracted.accountNumber || undefined,
+    accountName: extracted.accountName,
+    bankName: extracted.bankName,
+    checkoutUrl: checkout.checkoutUrl,
+    raw: checkout.raw,
+  };
 }
 
 /** Reserve a dedicated virtual account for wallet funding. */
@@ -394,16 +501,37 @@ export function verifyMonnifyWebhookHash(body: Record<string, unknown>): boolean
 
 export function describeBankTransferInstructions(
   reference: string,
-  amount: Kobo
+  amount: Kobo,
+  details?: {
+    accountNumber?: string;
+    accountName?: string;
+    bankName?: string;
+    expiresOn?: string;
+    checkoutUrl?: string;
+  }
 ): string {
-  return [
-    `*Bank transfer payment*`,
-    `Amount: ${formatNgn(amount)}`,
-    `Reference: ${reference}`,
-    ``,
-    `Transfer the exact amount and use the reference as narration.`,
-    `We will confirm automatically when payment lands.`,
-  ].join('\n');
+  const lines = [`*Bank transfer payment*`, `Amount: ${formatNgn(amount)}`];
+  if (details?.bankName) lines.push(`Bank: *${details.bankName}*`);
+  if (details?.accountName) lines.push(`Account name: *${details.accountName}*`);
+  if (details?.accountNumber) {
+    lines.push(`Account number: *${details.accountNumber}*`);
+  }
+  lines.push(`Reference: ${reference}`);
+  if (details?.expiresOn) lines.push(`Valid until: ${details.expiresOn}`);
+  lines.push('');
+  if (details?.accountNumber) {
+    lines.push(
+      'Transfer the *exact amount* to the account above.',
+      'Use the reference as narration if your bank asks for it.',
+      'We will confirm automatically when payment lands.'
+    );
+  } else {
+    lines.push(
+      'Bank account details were not returned. Pay with the link below if shown.'
+    );
+    if (details?.checkoutUrl) lines.push(details.checkoutUrl);
+  }
+  return lines.join('\n');
 }
 
 export interface MonnifyBank {
